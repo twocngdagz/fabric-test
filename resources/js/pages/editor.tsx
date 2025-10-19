@@ -1,6 +1,5 @@
 // filepath: resources/js/pages/editor.tsx
-import { Head, Link } from '@inertiajs/react';
-import { home } from '@/routes';
+import { Head } from '@inertiajs/react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Canvas, Pattern, Point, FabricImage, Rect, util, type TFiller, type FabricObject } from 'fabric';
 import type { CanvasEvents } from 'fabric';
@@ -12,6 +11,11 @@ type FrameData = {
     fit: 'cover' | 'contain';
     name: string;
 };
+
+// Also bind image metadata to track which frame it belongs to
+interface ImageDataMeta { frameOf: string }
+
+type WithImageData<T> = T & { data?: ImageDataMeta };
 
 // Helper: set a background image with CSS-like `cover` behavior and center it.
 // Fabric 6: backgroundImage is a FabricObject assigned via property (no setBackgroundImage())
@@ -102,11 +106,61 @@ function snapToGrid(rect: Rect) {
     rect.setCoords(); // keep controls aligned (Fabric 6)
 }
 
+// Helper: list images linked to a frame
+function getImagesForFrame(canvas: Canvas | null, frameId: string): FabricImage[] {
+    if (!canvas) return [];
+    return canvas
+        .getObjects()
+        .filter((o): o is FabricImage => o instanceof FabricImage && (o as WithImageData<FabricImage>).data?.frameOf === frameId);
+}
+
+// Compute scale and placement for image to fit a frame (cover/contain)
+function fitImageToFrame(img: FabricImage, frame: Rect, fit: 'cover' | 'contain') {
+    const fW = frame.getScaledWidth();
+    const fH = frame.getScaledHeight();
+    const iW = img.width ?? 0;
+    const iH = img.height ?? 0;
+    if (!iW || !iH) return;
+    const sx = fW / iW;
+    const sy = fH / iH;
+    const scale = fit === 'cover' ? Math.max(sx, sy) : Math.min(sx, sy);
+    img.scaleX = scale;
+    img.scaleY = scale;
+    // center the image over the frame
+    const left = (frame.left ?? 0) + fW / 2;
+    const top = (frame.top ?? 0) + fH / 2;
+    img.set({ originX: 'center', originY: 'center', left, top });
+    img.setCoords();
+}
+
+// Ensure image has a clipPath aligned to the frame rect (absolute positioning, follows frame)
+function ensureImageClip(img: FabricImage, frame: Rect) {
+    const fW = frame.getScaledWidth();
+    const fH = frame.getScaledHeight();
+    // Avoid instanceof checks against clipPath; inspect type field instead
+    const existingClip = img.clipPath as unknown as FabricObject | undefined;
+    const clip = existingClip && existingClip.type === 'rect' ? (existingClip as unknown as Rect) : new Rect();
+    clip.set({
+        left: frame.left ?? 0,
+        top: frame.top ?? 0,
+        width: fW,
+        height: fH,
+        rx: frame.rx ?? 0,
+        ry: frame.ry ?? 0,
+        absolutePositioned: true,
+        originX: 'left',
+        originY: 'top',
+    });
+    img.clipPath = clip;
+    img.setCoords();
+}
+
 export default function EditorPage() {
     // Fabric canvas refs
     const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
     const fabricCanvasRef = useRef<Canvas | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const frameFileInputRef = useRef<HTMLInputElement | null>(null);
 
     // Panel state reflecting currently selected frame
     const [activeFrame, setActiveFrame] = useState<Rect | null>(null);
@@ -116,6 +170,26 @@ export default function EditorPage() {
     const [yField, setYField] = useState<string>('');
     const [wField, setWField] = useState<string>('');
     const [hField, setHField] = useState<string>('');
+
+    // Update all images for a frame (re-clip and optionally re-fit)
+    const updateImagesForFrame = useCallback((frame: Rect, opts?: { refit?: boolean }) => {
+        const d = getRectData(frame);
+        if (!d) return;
+        const canvas = fabricCanvasRef.current;
+        const images = getImagesForFrame(canvas, d.frameId);
+        for (const img of images) {
+            ensureImageClip(img, frame);
+            if (opts?.refit) {
+                fitImageToFrame(img, frame, d.fit);
+            } else {
+                const fW = frame.getScaledWidth();
+                const fH = frame.getScaledHeight();
+                img.set({ left: (frame.left ?? 0) + fW / 2, top: (frame.top ?? 0) + fH / 2 });
+                img.setCoords();
+            }
+        }
+        canvas?.requestRenderAll();
+    }, []);
 
     // Zoom helpers (Fabric 6): use zoomToPoint for centered zoom
     const zoomBy = useCallback((factor: number) => {
@@ -164,9 +238,17 @@ export default function EditorPage() {
             // Laravel 12 UploadController expects field name 'image'
             form.append('image', file);
             const res = await fetch('/api/upload', { method: 'POST', body: form });
-            if (!res.ok) throw new Error(`Upload failed (${res.status})`);
+            if (!res.ok) {
+                console.error('Upload failed', res.status, res.statusText);
+                alert('Upload failed. Please try another file.');
+                return;
+            }
             const data = (await res.json()) as { url?: string };
-            if (!data.url) throw new Error('Invalid upload response');
+            if (!data.url) {
+                console.error('Invalid upload response payload');
+                alert('Upload failed. Invalid server response.');
+                return;
+            }
             const canvas = fabricCanvasRef.current;
             if (!canvas) return;
             await setBackgroundCover(canvas, data.url);
@@ -261,8 +343,9 @@ export default function EditorPage() {
         const top = Number.isFinite(nextY as number) ? (nextY as number) : rect.top ?? 0;
         rect.set({ left, top });
         rect.setCoords();
+        updateImagesForFrame(rect, { refit: false });
         fabricCanvasRef.current?.requestRenderAll();
-    }, [activeFrame]);
+    }, [activeFrame, updateImagesForFrame]);
 
     const commitSize = useCallback((nextW?: number, nextH?: number) => {
         const rect = activeFrame;
@@ -277,8 +360,9 @@ export default function EditorPage() {
         const scaleY = baseH ? scaledH / baseH : rect.scaleY ?? 1;
         rect.set({ scaleX, scaleY });
         rect.setCoords();
+        updateImagesForFrame(rect, { refit: true });
         fabricCanvasRef.current?.requestRenderAll();
-    }, [activeFrame]);
+    }, [activeFrame, updateImagesForFrame]);
 
     // Selection and transforms wiring
     useEffect(() => {
@@ -332,26 +416,36 @@ export default function EditorPage() {
         canvas.on('selection:cleared', onSelectionChange);
 
         // Live update panel when moving/scaling the active frame
-        const onMovingOrScaling = (e: CanvasEvents['object:moving']) => {
+        const onObjectMoving = (e: CanvasEvents['object:moving']) => {
             const t = e?.target as Rect;
             if (!t || !getRectData(t)) return;
-            // Refresh panel numeric values in real-time
             setXField(String(Math.round(t.left ?? 0)));
             setYField(String(Math.round(t.top ?? 0)));
             setWField(String(Math.round(t.getScaledWidth())));
             setHField(String(Math.round(t.getScaledHeight())));
+            updateImagesForFrame(t, { refit: false });
         };
-        canvas.on('object:moving', onMovingOrScaling);
-        canvas.on('object:scaling', onMovingOrScaling as unknown as (e: CanvasEvents['object:scaling']) => void);
+        const onObjectScaling = (e: CanvasEvents['object:scaling']) => {
+            const t = e?.target as Rect;
+            if (!t || !getRectData(t)) return;
+            setXField(String(Math.round(t.left ?? 0)));
+            setYField(String(Math.round(t.top ?? 0)));
+            setWField(String(Math.round(t.getScaledWidth())));
+            setHField(String(Math.round(t.getScaledHeight())));
+            updateImagesForFrame(t, { refit: true });
+        };
+        canvas.on('object:moving', onObjectMoving);
+        canvas.on('object:scaling', onObjectScaling);
 
-        // Snap on modify end (Fabric v5+ fires object:modified for move/scale/rotate completion)
+        // Snap on modify end
         const onModified = (e: CanvasEvents['object:modified']) => {
             const t = e?.target as Rect;
             if (!t || !getRectData(t)) return;
             snapToGrid(t);
             canvas.requestRenderAll();
-            // After snap, re-sync
+            // After snap, re-sync & refit
             syncPanelFromRect(t);
+            updateImagesForFrame(t, { refit: true });
         };
         canvas.on('object:modified', onModified);
 
@@ -384,8 +478,8 @@ export default function EditorPage() {
             canvas.off('selection:created', onSelectionChange);
             canvas.off('selection:updated', onSelectionChange);
             canvas.off('selection:cleared', onSelectionChange);
-            canvas.off('object:moving', onMovingOrScaling);
-            canvas.off('object:scaling', onMovingOrScaling as unknown as (e: CanvasEvents['object:scaling']) => void);
+            canvas.off('object:moving', onObjectMoving);
+            canvas.off('object:scaling', onObjectScaling);
             canvas.off('object:modified', onModified);
             window.removeEventListener('keydown', onKeyDown);
             // Fabric 6 cleanup: dispose releases events, DOM refs, and internal state
@@ -393,7 +487,66 @@ export default function EditorPage() {
             fabricCanvasRef.current = null;
         };
 
-    }, [syncPanelFromRect, zoomIn, zoomOut]);
+    }, [syncPanelFromRect, zoomIn, zoomOut, updateImagesForFrame]);
+
+    // Toolbar: trigger upload-to-frame
+    const onPickUploadToFrame = useCallback(() => {
+        if (!activeFrame || !getRectData(activeFrame)) {
+            alert('Please select a frame first.');
+            return;
+        }
+        frameFileInputRef.current?.click();
+    }, [activeFrame]);
+
+    // Handle image selection for frame upload
+    const onFrameFileSelected = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        e.target.value = '';
+        if (!file) return;
+        const frame = activeFrame;
+        const d = frame && getRectData(frame);
+        if (!frame || !d) {
+            alert('Please select a frame first.');
+            return;
+        }
+        try {
+            const form = new FormData();
+            form.append('image', file);
+            const res = await fetch('/api/upload', { method: 'POST', body: form });
+            if (!res.ok) {
+                console.error('Upload failed', res.status, res.statusText);
+                alert('Upload failed. Please try another file.');
+                return;
+            }
+            const data = (await res.json()) as { url?: string };
+            if (!data.url) {
+                console.error('Invalid upload response payload');
+                alert('Upload failed. Invalid server response.');
+                return;
+            }
+
+            const el = await util.loadImage(data.url);
+            const img = new FabricImage(el);
+            img.set({ selectable: false, evented: false });
+            // Link to frame
+            (img as WithImageData<FabricImage>).data = { frameOf: d.frameId };
+
+            // Place and clip
+            fitImageToFrame(img, frame, d.fit);
+            ensureImageClip(img, frame);
+
+            const canvas = fabricCanvasRef.current;
+            if (!canvas) return;
+            canvas.add(img);
+            // Keep frame visually on top of its image by removing and re-adding it (Fabric v6 types omit moveTo on objects)
+            canvas.remove(frame);
+            canvas.add(frame);
+            canvas.requestRenderAll();
+        } catch (err) {
+            console.error(err);
+            alert('Failed to upload image to frame.');
+        }
+    }, [activeFrame]);
 
     // Panel change handlers
     const onChangeName = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -413,7 +566,9 @@ export default function EditorPage() {
         const d = getRectData(rect);
         if (!d) return;
         setRectData(rect, { ...d, fit: value });
-    }, [activeFrame]);
+        // Refit any linked images when fit mode changes
+        updateImagesForFrame(rect, { refit: true });
+    }, [activeFrame, updateImagesForFrame]);
 
     const onChangeX = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
         const v = e.target.value;
@@ -450,12 +605,6 @@ export default function EditorPage() {
             {/* Top toolbar */}
             <header className="border-b border-border bg-card/80 backdrop-blur supports-[backdrop-filter]:bg-card/60">
                 <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2 p-3">
-                    <div className="flex items-center gap-3 text-sm">
-                        <Link href={home()} className="underline underline-offset-2 hover:opacity-80">
-                            ← Home
-                        </Link>
-                        <span className="hidden text-muted-foreground sm:inline">Fabric Canvas Editor</span>
-                    </div>
                     {/* Toolbar wired: Background, Add Frame */}
                     <div className="flex flex-wrap items-center gap-2">
                         <button type="button" onClick={onPickBackground} className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent">
@@ -474,9 +623,16 @@ export default function EditorPage() {
                         <button type="button" onClick={resetView} className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent">
                             Reset View
                         </button>
-                        <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent" disabled>
+                        <button type="button" onClick={onPickUploadToFrame} className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent">
                             Upload to Frame
                         </button>
+                        <input
+                            ref={frameFileInputRef}
+                            type="file"
+                            accept="image/*"
+                            className="sr-only"
+                            onChange={onFrameFileSelected}
+                        />
                         <div className="mx-1 hidden h-5 w-px bg-border sm:block" />
                         <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent" disabled>
                             Export PNG
