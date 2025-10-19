@@ -15,14 +15,19 @@ type FrameData = {
 // Also bind image metadata to track which frame it belongs to
 interface ImageDataMeta { frameOf: string }
 
+// Background metadata attached to background FabricImage
+interface BackgroundMeta { type: 'background'; url: string }
+
 type WithImageData<T> = T & { data?: ImageDataMeta };
+// For background image only
+type WithBackgroundData<T> = T & { data?: BackgroundMeta };
 
 // Helper: set a background image with CSS-like `cover` behavior and center it.
 // Fabric 6: backgroundImage is a FabricObject assigned via property (no setBackgroundImage())
 async function setBackgroundCover(canvas: Canvas, url: string) {
     // Load image element via Fabric util, then wrap in FabricImage
     const el = await util.loadImage(url);
-    const img = new FabricImage(el);
+    const img = new FabricImage(el) as WithBackgroundData<FabricImage>;
 
     // Compute cover scale to fill 1200x800 while preserving aspect ratio
     const cw = canvas.getWidth();
@@ -47,6 +52,9 @@ async function setBackgroundCover(canvas: Canvas, url: string) {
         evented: false,
         excludeFromExport: false,
     });
+    // Attach original source url so we can serialize later
+    img.data = { ...(img.data ?? {}), type: 'background', url };
+
     img.scaleX = scale;
     img.scaleY = scale;
 
@@ -58,6 +66,33 @@ async function setBackgroundCover(canvas: Canvas, url: string) {
     canvas.backgroundImage = undefined;
     canvas.backgroundImage = img;
     canvas.requestRenderAll();
+}
+
+// Helper: clear background image but keep checkerboard pattern
+function clearBackground(canvas: Canvas) {
+    canvas.backgroundImage = undefined;
+    canvas.requestRenderAll();
+}
+
+// Try to resolve a serializable URL for current background image
+function getCanvasBackgroundUrl(canvas: Canvas): string | null {
+    const bg = canvas.backgroundImage as unknown as FabricImage | undefined;
+    if (!bg) return null;
+    // Prefer custom data.url we attach in setBackgroundCover
+    const withData = bg as unknown as WithBackgroundData<FabricImage>;
+    const metaUrl = withData.data?.url;
+    if (typeof metaUrl === 'string' && metaUrl.length > 0) return metaUrl;
+    // Fall back to FabricImage element or src fields
+    try {
+        const hasGet = typeof (bg as FabricImage).getElement === 'function';
+        const el = hasGet ? (bg as FabricImage).getElement() : null;
+        const src = (el && 'currentSrc' in el ? (el as HTMLImageElement).currentSrc : undefined)
+            || (el && 'src' in el ? (el as HTMLImageElement).src : undefined)
+            || (bg as unknown as { src?: string }).src;
+        return typeof src === 'string' ? src : null;
+    } catch {
+        return null;
+    }
 }
 
 // Small util: v4+ browsers expose crypto.randomUUID; fallback keeps collisions unlikely
@@ -752,6 +787,7 @@ export default function EditorPage() {
     type TemplateV1 = {
         version: 1;
         canvas: { width: number; height: number };
+        background_url: string | null;
         frames: Array<{ id: string; x: number; y: number; w: number; h: number; fit: 'cover' | 'contain'; name: string }>;
     };
 
@@ -759,9 +795,12 @@ export default function EditorPage() {
         const canvas = fabricCanvasRef.current;
         if (!canvas) return null;
         const frames = getFrames();
+        // Determine background url if any (we store URL returned by /api/upload)
+        const bgUrl = getCanvasBackgroundUrl(canvas);
         return {
             version: 1,
             canvas: { width: canvas.getWidth(), height: canvas.getHeight() },
+            background_url: bgUrl ?? null,
             frames: frames.map((r) => {
                 const d = getRectData(r)!;
                 return {
@@ -803,23 +842,54 @@ export default function EditorPage() {
     const rebuildFromTemplate = useCallback((tpl: unknown) => {
         const canvas = fabricCanvasRef.current;
         if (!canvas) return;
-        type DbShape = { data?: { canvas_width: number; canvas_height: number; elements: TemplateV1['frames'] } };
+        type DbShape = { data: { canvas_width: number; canvas_height: number; elements: unknown } };
+        type ElementsObj = { frames?: unknown; background_url?: unknown; canvas?: unknown };
         let t: TemplateV1 | null = null;
         if (typeof tpl === 'object' && tpl !== null) {
             const o = tpl as Record<string, unknown>;
-            if ('version' in o && typeof o.version === 'number') {
-                const v = o as unknown as TemplateV1;
-                if (v.version === 1) t = v;
+            if ('version' in o && typeof (o as Record<string, unknown>).version === 'number') {
+                const v = o as { version: number; canvas?: { width?: unknown; height?: unknown }; background_url?: unknown; frames?: unknown };
+                if (v.version === 1) {
+                    const cw = Number(v.canvas?.width);
+                    const ch = Number(v.canvas?.height);
+                    t = {
+                        version: 1,
+                        canvas: { width: Number.isFinite(cw) ? cw : 1200, height: Number.isFinite(ch) ? ch : 800 },
+                        background_url: typeof v.background_url === 'string' ? v.background_url : null,
+                        frames: Array.isArray(v.frames) ? (v.frames as TemplateV1['frames']) : [],
+                    };
+                }
             } else if ('data' in o && typeof o.data === 'object' && o.data !== null) {
                 const db = o as unknown as DbShape;
-                if (db.data) {
-                    t = { version: 1, canvas: { width: db.data.canvas_width, height: db.data.canvas_height }, frames: db.data.elements ?? [] };
+                // Backward compat: elements may be array (frames only) or object with frames/background_url
+                const el = db.data.elements;
+                if (Array.isArray(el)) {
+                    t = { version: 1, canvas: { width: db.data.canvas_width, height: db.data.canvas_height }, background_url: null, frames: el as TemplateV1['frames'] };
+                } else if (el && typeof el === 'object') {
+                    const eo = el as ElementsObj;
+                    const frames = Array.isArray(eo.frames) ? (eo.frames as TemplateV1['frames']) : [];
+                    const bg = typeof eo.background_url === 'string' ? eo.background_url : null;
+                    const c = (eo.canvas && typeof eo.canvas === 'object') ? (eo.canvas as { width?: unknown; height?: unknown }) : {};
+                    const cw = Number(c.width);
+                    const ch = Number(c.height);
+                    t = { version: 1, canvas: { width: Number.isFinite(cw) ? cw : db.data.canvas_width, height: Number.isFinite(ch) ? ch : db.data.canvas_height }, background_url: bg, frames };
                 }
             }
         }
         if (!t) { alert('Unsupported template format.'); return; }
+        // Resize canvas
         canvas.setDimensions({ width: t.canvas.width, height: t.canvas.height });
+        // Clear objects and background first
         clearAllObjects();
+        clearBackground(canvas);
+        // Restore background if available; log and ignore if it fails to load
+        if (t.background_url) {
+            setBackgroundCover(canvas, t.background_url).catch((err) => {
+                // Fail gracefully on 404 or load errors
+                console.warn('Background image failed to load; proceeding without it', err);
+                clearBackground(canvas);
+            });
+        }
         for (const f of t.frames) {
             const rect = new Rect({
                 left: f.x, top: f.y, width: f.w, height: f.h,
