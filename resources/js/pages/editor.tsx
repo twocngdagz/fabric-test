@@ -171,6 +171,11 @@ export default function EditorPage() {
     const [wField, setWField] = useState<string>('');
     const [hField, setHField] = useState<string>('');
 
+    // Export state: last export URL, loading, and a tiny toast flag
+    const [exportUrl, setExportUrl] = useState<string | null>(null);
+    const [exporting, setExporting] = useState<boolean>(false);
+    const [showToast, setShowToast] = useState<boolean>(false);
+
     // Update all images for a frame (re-clip and optionally re-fit)
     const updateImagesForFrame = useCallback((frame: Rect, opts?: { refit?: boolean }) => {
         const d = getRectData(frame);
@@ -222,6 +227,81 @@ export default function EditorPage() {
         return canvas.getObjects().filter((o): o is Rect => getObjectFrameData(o) !== undefined);
     }, []);
 
+    // Derive a reasonable export name (first frame name if present)
+    const getExportName = useCallback(() => {
+        const frames = getFrames();
+        if (frames.length === 0) return 'canvas';
+        const d = getRectData(frames[0]);
+        return (d?.name || 'canvas').trim() || 'canvas';
+    }, [getFrames]);
+
+    // Perform export: hide grid/controls, capture PNG, POST to API, restore UI
+    const onExportPng = useCallback(async () => {
+        const canvas = fabricCanvasRef.current;
+        if (!canvas || exporting) return;
+        setExporting(true);
+
+        // Save previous background filler (grid) and selection
+        const prevBg = (canvas.backgroundColor ?? 'transparent') as unknown as TFiller | string;
+        const prevActive = canvas.getActiveObject();
+
+        try {
+            // Hide selection controls (Fabric 6 selection outlines are not exported, but discard for cleanliness)
+            if (prevActive) {
+                canvas.discardActiveObject();
+            }
+
+            // Hide the grid by making background transparent
+            canvas.backgroundColor = 'transparent' as unknown as TFiller;
+            // Ensure a fresh render before capture (Fabric 6: render is sync, requestRenderAll schedules; renderAll forces immediately)
+            canvas.renderAll();
+
+            // Capture PNG; Fabric 6 toDataURL requires `multiplier` in TDataUrlOptions typings
+            const dataUrl = canvas.toDataURL({ format: 'png', multiplier: 1 });
+
+            // POST to backend export endpoint (Laravel 12 API route)
+            const name = getExportName();
+            const res = await fetch('/api/export', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json',
+                },
+                body: JSON.stringify({ dataUrl, name }),
+            });
+
+            if (!res.ok) {
+                const text = await res.text();
+                console.error('Export failed', res.status, text);
+                alert('Export failed. Please try again.');
+                return;
+            }
+
+            const payload = (await res.json()) as { url?: string };
+            if (!payload.url) {
+                alert('Export failed. Invalid server response.');
+                return;
+            }
+
+            setExportUrl(payload.url);
+            // Tiny toast for success
+            setShowToast(true);
+            // Auto-hide toast after 2.5s
+            window.setTimeout(() => setShowToast(false), 2500);
+        } catch (err) {
+            console.error(err);
+            alert('Unexpected error during export.');
+        } finally {
+            // Restore grid background and selection state, then re-render
+            canvas.backgroundColor = prevBg as unknown as TFiller;
+            if (prevActive) {
+                canvas.setActiveObject(prevActive);
+            }
+            canvas.requestRenderAll();
+            setExporting(false);
+        }
+    }, [exporting, getExportName]);
+
     // Background button -> open file picker
     const onPickBackground = useCallback(() => {
         fileInputRef.current?.click();
@@ -263,7 +343,7 @@ export default function EditorPage() {
     const onAddFrame = useCallback(() => {
         const canvas = fabricCanvasRef.current;
         if (!canvas) return;
-        const frames = getFrames();
+        const frames = canvas.getObjects().filter((o): o is Rect => getObjectFrameData(o) !== undefined);
         const n = frames.length + 1;
         const id = newId();
 
@@ -309,7 +389,8 @@ export default function EditorPage() {
         setYField(String(Math.round(rect.top ?? 0)));
         setWField(String(Math.round(scaledW)));
         setHField(String(Math.round(scaledH)));
-    }, [getFrames]);
+    }, []);
+
 
     // Keep panel fields in sync with a given rect
     const syncPanelFromRect = useCallback((rect: Rect | null) => {
@@ -634,8 +715,14 @@ export default function EditorPage() {
                             onChange={onFrameFileSelected}
                         />
                         <div className="mx-1 hidden h-5 w-px bg-border sm:block" />
-                        <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent" disabled>
-                            Export PNG
+                        <button
+                            type="button"
+                            onClick={onExportPng}
+                            disabled={exporting}
+                            className="rounded-md border border-border bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                            title="Export PNG"
+                        >
+                            {exporting ? 'Exporting…' : 'Export PNG'}
                         </button>
                         <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent" disabled>
                             Save Template
@@ -646,6 +733,15 @@ export default function EditorPage() {
                     </div>
                 </div>
             </header>
+
+            {/* Toast */}
+            {showToast && (
+                <div className="pointer-events-none fixed inset-x-0 top-3 z-50 flex justify-center">
+                    <div className="pointer-events-auto rounded-md border border-border bg-emerald-600/95 px-3 py-2 text-sm font-medium text-white shadow">
+                        Export success
+                    </div>
+                </div>
+            )}
 
             {/* Main content */}
             <main className="mx-auto max-w-7xl p-4">
@@ -669,6 +765,21 @@ export default function EditorPage() {
                         <p className="mt-3 text-center text-xs text-muted-foreground">
                             Canvas area with Fabric 6. Use + / - keys to zoom. The checkerboard indicates transparency. Press Delete to remove a selected frame.
                         </p>
+
+                        {/* Last export preview */}
+                        {exportUrl && (
+                            <div className="mt-4 rounded-md border border-border bg-background p-2">
+                                <div className="mb-1 text-xs font-medium text-muted-foreground">Last export</div>
+                                <a href={exportUrl} target="_blank" rel="noreferrer" className="inline-block">
+                                    <img src={exportUrl} alt="Last export preview" className="h-28 w-auto rounded-sm border border-border" />
+                                </a>
+                                <div className="mt-1 text-xs">
+                                    <a href={exportUrl} target="_blank" rel="noreferrer" className="text-primary underline">
+                                        Open image
+                                    </a>
+                                </div>
+                            </div>
+                        )}
                     </section>
 
                     {/* Right properties panel */}

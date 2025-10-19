@@ -15,7 +15,7 @@ class UploadImageRequest extends FormRequest
     {
         // max is in kilobytes; 10MB = 10240 KB
         return [
-            'image' => ['required', 'file', 'mimes:jpeg,jpg,png', 'max:10240'],
+            'image' => ['required', 'file', 'mimes:jpeg,jpg,png', 'max:20480'],
         ];
     }
 }
