@@ -185,6 +185,9 @@ export default function EditorPage() {
     const [loadBusy, setLoadBusy] = useState(false);
     const [lastSavedId, setLastSavedId] = useState<number | null>(null);
     const [infoToast, setInfoToast] = useState<string | null>(null);
+    // New: export options
+    const [exportFormat, setExportFormat] = useState<'png' | 'jpeg'>('png');
+    const [jpegQuality, setJpegQuality] = useState<number>(90); // 60–95
 
     // Update all images for a frame (re-clip and optionally re-fit)
     const updateImagesForFrame = useCallback((frame: Rect, opts?: { refit?: boolean }) => {
@@ -239,13 +242,15 @@ export default function EditorPage() {
 
     // Derive a reasonable export name (first frame name if present)
     const getExportName = useCallback(() => {
-        const frames = getFrames();
-        if (frames.length === 0) return 'canvas';
-        const d = getRectData(frames[0]);
-        return (d?.name || 'canvas').trim() || 'canvas';
-    }, [getFrames]);
+        // New behavior: explicit timestamped photobooth name with correct extension per requirements
+        const ts = new Date();
+        const pad = (n: number) => n.toString().padStart(2, '0');
+        const stamp = `${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}`;
+        const ext = exportFormat === 'jpeg' ? 'jpg' : 'png';
+        return `photobooth-${stamp}.${ext}`;
+    }, [exportFormat]);
 
-    // Perform export: hide grid/controls, capture PNG, POST to API, restore UI
+    // Perform export: hide grid/controls, capture PNG/JPEG, POST to API, restore UI
     const onExportPng = useCallback(async () => {
         const canvas = fabricCanvasRef.current;
         if (!canvas || exporting) return;
@@ -256,20 +261,21 @@ export default function EditorPage() {
         const prevActive = canvas.getActiveObject();
 
         try {
-            // Hide selection controls (Fabric 6 selection outlines are not exported, but discard for cleanliness)
             if (prevActive) {
                 canvas.discardActiveObject();
             }
 
             // Hide the grid by making background transparent
             canvas.backgroundColor = 'transparent' as unknown as TFiller;
-            // Ensure a fresh render before capture (Fabric 6: render is sync, requestRenderAll schedules; renderAll forces immediately)
             canvas.renderAll();
 
-            // Capture PNG; Fabric 6 toDataURL requires `multiplier` in TDataUrlOptions typings
-            const dataUrl = canvas.toDataURL({ format: 'png', multiplier: 1 });
+            // Capture with selected format and quality. Fabric 6 toDataURL docs:
+            // https://fabricjs.com/docs/fabric.Canvas.html#toDataURL
+            const fmt = exportFormat === 'jpeg' ? 'jpeg' : 'png';
+            const q = fmt === 'jpeg' ? Math.max(0.6, Math.min(0.95, jpegQuality / 100)) : 1;
+            const dataUrl = canvas.toDataURL({ format: fmt, quality: q, multiplier: 1 });
 
-            // POST to backend export endpoint (Laravel 12 API route)
+            // POST to backend export endpoint
             const name = getExportName();
             const res = await fetch('/api/export', {
                 method: 'POST',
@@ -294,15 +300,12 @@ export default function EditorPage() {
             }
 
             setExportUrl(payload.url);
-            // Tiny toast for success
             setShowToast(true);
-            // Auto-hide toast after 2.5s
             window.setTimeout(() => setShowToast(false), 2500);
         } catch (err) {
             console.error(err);
             alert('Unexpected error during export.');
         } finally {
-            // Restore grid background and selection state, then re-render
             canvas.backgroundColor = prevBg as unknown as TFiller;
             if (prevActive) {
                 canvas.setActiveObject(prevActive);
@@ -310,7 +313,7 @@ export default function EditorPage() {
             canvas.requestRenderAll();
             setExporting(false);
         }
-    }, [exporting, getExportName]);
+    }, [exporting, exportFormat, jpegQuality, getExportName]);
 
     // Background button -> open file picker
     const onPickBackground = useCallback(() => {
@@ -903,14 +906,40 @@ export default function EditorPage() {
                             onChange={onFrameFileSelected}
                         />
                         <div className="mx-1 hidden h-5 w-px bg-border sm:block" />
+
+                        {/* Export options */}
+                        <label className="text-sm">Format</label>
+                        <select
+                            value={exportFormat}
+                            onChange={(e) => setExportFormat(e.target.value === 'jpeg' ? 'jpeg' : 'png')}
+                            className="rounded-md border border-input bg-background px-2 py-1 text-sm"
+                        >
+                            <option value="png">PNG</option>
+                            <option value="jpeg">JPEG</option>
+                        </select>
+                        {exportFormat === 'jpeg' && (
+                            <div className="flex items-center gap-2">
+                                <label className="text-sm">Quality</label>
+                                <input
+                                    type="range"
+                                    min={60}
+                                    max={95}
+                                    step={1}
+                                    value={jpegQuality}
+                                    onChange={(e) => setJpegQuality(Number(e.target.value))}
+                                />
+                                <span className="w-10 text-right text-xs tabular-nums">{jpegQuality}</span>
+                            </div>
+                        )}
+
                         <button
                             type="button"
                             onClick={onExportPng}
                             disabled={exporting}
                             className="rounded-md border border-border bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
-                            title="Export PNG"
+                            title={exportFormat === 'jpeg' ? `Export JPEG (${jpegQuality})` : 'Export PNG'}
                         >
-                            {exporting ? 'Exporting…' : 'Export PNG'}
+                            {exporting ? 'Exporting…' : exportFormat === 'jpeg' ? `Export JPEG (${jpegQuality})` : 'Export PNG'}
                         </button>
                         <button
                             type="button"
