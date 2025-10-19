@@ -157,10 +157,15 @@ function ensureImageClip(img: FabricImage, frame: Rect) {
 
 export default function EditorPage() {
     // Fabric canvas refs
-    const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
     const fabricCanvasRef = useRef<Canvas | null>(null);
+    const fabricMountRef = useRef<HTMLDivElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const frameFileInputRef = useRef<HTMLInputElement | null>(null);
+
+    // Drag-and-drop state for canvas container
+    const canvasContainerRef = useRef<HTMLDivElement | null>(null);
+    const dragCounterRef = useRef(0);
+    const [dragActive, setDragActive] = useState(false);
 
     // Panel state reflecting currently selected frame
     const [activeFrame, setActiveFrame] = useState<Rect | null>(null);
@@ -452,8 +457,13 @@ export default function EditorPage() {
 
     // Selection and transforms wiring
     useEffect(() => {
-        const el = canvasElementRef.current;
-        if (!el) return;
+        const mount = fabricMountRef.current;
+        if (!mount) return;
+
+        // Create a canvas element imperatively to avoid React reconciliation issues
+        const el = document.createElement('canvas');
+        // Append before Fabric wraps it; Fabric will insert its own wrapper around this element
+        mount.appendChild(el);
 
         // Initialize Fabric 6 canvas
         const canvas = new Canvas(el, {
@@ -571,6 +581,9 @@ export default function EditorPage() {
             // Fabric 6 cleanup: dispose releases events, DOM refs, and internal state
             canvas.dispose();
             fabricCanvasRef.current = null;
+            // Clear mount content to remove wrapper/canvases left by Fabric
+            try { if (mount.contains(el)) mount.removeChild(el); } catch { /* ignore DOM cleanup errors */ }
+            mount.innerHTML = '';
         };
 
     }, [syncPanelFromRect, zoomIn, zoomOut, updateImagesForFrame]);
@@ -584,20 +597,21 @@ export default function EditorPage() {
         frameFileInputRef.current?.click();
     }, [activeFrame]);
 
-    // Handle image selection for frame upload
-    const onFrameFileSelected = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0];
-        e.target.value = '';
-        if (!file) return;
+    // Helper to upload a File and insert into the currently active frame
+    const uploadFileToActiveFrame = useCallback(async (file: File) => {
         const frame = activeFrame;
         const d = frame && getRectData(frame);
         if (!frame || !d) {
-            alert('Please select a frame first.');
+            // Use app toast instead of blocking alert
+            setInfoToast('Please select a frame first.');
+            window.setTimeout(() => setInfoToast(null), 2500);
             return;
         }
         try {
             const form = new FormData();
             form.append('image', file);
+            // React drag & drop uses DataTransfer API; upload via Fetch to Laravel route
+            // Docs: https://developer.mozilla.org/docs/Web/API/HTML_Drag_and_Drop_API
             const res = await fetch('/api/upload', { method: 'POST', body: form });
             if (!res.ok) {
                 console.error('Upload failed', res.status, res.statusText);
@@ -610,21 +624,16 @@ export default function EditorPage() {
                 alert('Upload failed. Invalid server response.');
                 return;
             }
-
             const el = await util.loadImage(data.url);
             const img = new FabricImage(el);
             img.set({ selectable: false, evented: false });
-            // Link to frame
             (img as WithImageData<FabricImage>).data = { frameOf: d.frameId };
-
-            // Place and clip
             fitImageToFrame(img, frame, d.fit);
-            ensureImageClip(img, frame);
-
+            ensureImageClip(img, frame); // Fabric clipPath: https://fabricjs.com/docs/fabric.Object.html#clipPath (v6)
             const canvas = fabricCanvasRef.current;
             if (!canvas) return;
             canvas.add(img);
-            // Keep frame visually on top of its image by removing and re-adding it (Fabric v6 types omit moveTo on objects)
+            // Keep frame above image
             canvas.remove(frame);
             canvas.add(frame);
             canvas.requestRenderAll();
@@ -632,7 +641,59 @@ export default function EditorPage() {
             console.error(err);
             alert('Failed to upload image to frame.');
         }
-    }, [activeFrame]);
+    }, [activeFrame, setInfoToast]);
+
+    // Handle image selection for frame upload
+    const onFrameFileSelected = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        e.target.value = '';
+        if (!file) return;
+        await uploadFileToActiveFrame(file);
+    }, [uploadFileToActiveFrame]);
+
+    // Drag-and-drop handlers on the canvas container
+    const onDragEnterContainer = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragCounterRef.current += 1;
+        const types = Array.from(e.dataTransfer?.types ?? []);
+        const hasFiles = types.includes('Files') || types.includes('public.file-url') || types.includes('text/uri-list');
+        if (hasFiles) setDragActive(true);
+    }, []);
+
+    const onDragOverContainer = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault(); // Required to allow drop
+        e.stopPropagation();
+        const types = Array.from(e.dataTransfer?.types ?? []);
+        const hasFiles = types.includes('Files') || types.includes('public.file-url') || types.includes('text/uri-list');
+        if (hasFiles) {
+            setDragActive(true);
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+        }
+    }, []);
+
+    const onDragLeaveContainer = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+        if (dragCounterRef.current === 0) setDragActive(false);
+    }, []);
+
+    const onDropContainer = useCallback(async (e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragCounterRef.current = 0;
+        setDragActive(false);
+        const files = e.dataTransfer?.files;
+        if (!files || files.length === 0) return;
+        const file = files[0]; // Process only the first file
+        if (!file) return;
+        if (!file.type || !file.type.startsWith('image/')) {
+            // ignore non-image
+            return;
+        }
+        await uploadFileToActiveFrame(file);
+    }, [uploadFileToActiveFrame]);
 
     // Panel change handlers
     const onChangeName = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -899,13 +960,23 @@ export default function EditorPage() {
                             {/* Centered canvas container with checkerboard background */}
                             <div className="relative max-w-full overflow-auto rounded-md border border-border shadow-sm">
                                 {/* Fixed-size working area per requirements (1200x800) */}
-                                <div className="bg-checker flex items-center justify-center p-4">
-                                    <canvas
-                                        ref={canvasElementRef}
-                                        // Do not set CSS width/height to avoid stretching. Fabric sets attributes.
-                                        className="block"
-                                    />
-                                </div>
+                                <div
+                                    ref={canvasContainerRef}
+                                    className={`relative bg-checker flex items-center justify-center p-4 ${dragActive ? 'ring-2 ring-emerald-500/80 ring-offset-2 ring-offset-card' : ''}`}
+                                    onDragEnter={onDragEnterContainer}
+                                    onDragOver={onDragOverContainer}
+                                    onDragLeave={onDragLeaveContainer}
+                                    onDrop={onDropContainer}
+                                >
+                                    {/* Visual overlay while dragging files over the canvas */}
+                                    {dragActive && (
+                                        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md border-2 border-emerald-500/80 bg-emerald-500/10">
+                                            <span className="rounded bg-emerald-600/90 px-2 py-1 text-xs font-medium text-white shadow">Drop image to place into selected frame</span>
+                                        </div>
+                                    )}
+                                    {/* Fabric mounts here; React will not manage any children to avoid DOM conflicts */}
+                                    <div ref={fabricMountRef} className="block" />
+                                 </div>
                             </div>
                         </div>
                         <p className="mt-3 text-center text-xs text-muted-foreground">
