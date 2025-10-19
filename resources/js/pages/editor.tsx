@@ -175,6 +175,11 @@ export default function EditorPage() {
     const [exportUrl, setExportUrl] = useState<string | null>(null);
     const [exporting, setExporting] = useState<boolean>(false);
     const [showToast, setShowToast] = useState<boolean>(false);
+    // New: Save/Load UX state
+    const [saveBusy, setSaveBusy] = useState(false);
+    const [loadBusy, setLoadBusy] = useState(false);
+    const [lastSavedId, setLastSavedId] = useState<number | null>(null);
+    const [infoToast, setInfoToast] = useState<string | null>(null);
 
     // Update all images for a frame (re-clip and optionally re-fit)
     const updateImagesForFrame = useCallback((frame: Rect, opts?: { refit?: boolean }) => {
@@ -572,7 +577,7 @@ export default function EditorPage() {
 
     // Toolbar: trigger upload-to-frame
     const onPickUploadToFrame = useCallback(() => {
-        if (!activeFrame || !getRectData(activeFrame)) {
+        if (!activeFrame || !getObjectFrameData(activeFrame)) {
             alert('Please select a frame first.');
             return;
         }
@@ -679,6 +684,128 @@ export default function EditorPage() {
         if (!Number.isNaN(n)) commitSize(undefined, n);
     }, [commitSize]);
 
+    // Template serialization: minimal v1 format
+    type TemplateV1 = {
+        version: 1;
+        canvas: { width: number; height: number };
+        frames: Array<{ id: string; x: number; y: number; w: number; h: number; fit: 'cover' | 'contain'; name: string }>;
+    };
+
+    const serializeTemplate = useCallback((): TemplateV1 | null => {
+        const canvas = fabricCanvasRef.current;
+        if (!canvas) return null;
+        const frames = getFrames();
+        return {
+            version: 1,
+            canvas: { width: canvas.getWidth(), height: canvas.getHeight() },
+            frames: frames.map((r) => {
+                const d = getRectData(r)!;
+                return {
+                    id: d.frameId,
+                    x: Math.round(r.left ?? 0),
+                    y: Math.round(r.top ?? 0),
+                    w: Math.round(r.getScaledWidth()),
+                    h: Math.round(r.getScaledHeight()),
+                    fit: d.fit,
+                    name: d.name,
+                };
+            }),
+        };
+    }, [getFrames]);
+
+    // Helpers to clear objects
+    const clearImages = useCallback(() => {
+        const canvas = fabricCanvasRef.current;
+        if (!canvas) return;
+        const prev = canvas.renderOnAddRemove;
+        canvas.renderOnAddRemove = false;
+        canvas.getObjects().forEach((o) => { if (o instanceof FabricImage) canvas.remove(o); });
+        canvas.renderOnAddRemove = prev;
+        canvas.requestRenderAll();
+    }, []);
+
+    const clearAllObjects = useCallback(() => {
+        const canvas = fabricCanvasRef.current;
+        if (!canvas) return;
+        const prev = canvas.renderOnAddRemove;
+        canvas.renderOnAddRemove = false;
+        canvas.getObjects().forEach((o) => canvas.remove(o));
+        canvas.renderOnAddRemove = prev;
+        canvas.requestRenderAll();
+        syncPanelFromRect(null);
+    }, [syncPanelFromRect]);
+
+    // Rebuild from template JSON or server DB payload
+    const rebuildFromTemplate = useCallback((tpl: unknown) => {
+        const canvas = fabricCanvasRef.current;
+        if (!canvas) return;
+        type DbShape = { data?: { canvas_width: number; canvas_height: number; elements: TemplateV1['frames'] } };
+        let t: TemplateV1 | null = null;
+        if (typeof tpl === 'object' && tpl !== null) {
+            const o = tpl as Record<string, unknown>;
+            if ('version' in o && typeof o.version === 'number') {
+                const v = o as unknown as TemplateV1;
+                if (v.version === 1) t = v;
+            } else if ('data' in o && typeof o.data === 'object' && o.data !== null) {
+                const db = o as unknown as DbShape;
+                if (db.data) {
+                    t = { version: 1, canvas: { width: db.data.canvas_width, height: db.data.canvas_height }, frames: db.data.elements ?? [] };
+                }
+            }
+        }
+        if (!t) { alert('Unsupported template format.'); return; }
+        canvas.setDimensions({ width: t.canvas.width, height: t.canvas.height });
+        clearAllObjects();
+        for (const f of t.frames) {
+            const rect = new Rect({
+                left: f.x, top: f.y, width: f.w, height: f.h,
+                fill: 'rgba(59,130,246,0.12)', stroke: '#3b82f6', strokeWidth: 2,
+                strokeDashArray: [6,6], strokeUniform: true, rx: 4, ry: 4,
+                hasRotatingPoint: false, lockRotation: true, selectable: true, evented: true,
+                cornerStyle: 'circle', transparentCorners: false,
+            });
+            setRectData(rect, { type: 'frame', frameId: f.id, fit: f.fit, name: f.name });
+            canvas.add(rect);
+        }
+        canvas.requestRenderAll();
+    }, [clearAllObjects]);
+
+    // Save and Load handlers
+    const onSaveTemplate = useCallback(async () => {
+        if (saveBusy) return;
+        const payload = serializeTemplate();
+        if (!payload) return;
+        setSaveBusy(true);
+        try {
+            const res = await fetch('/api/templates', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload) });
+            if (!res.ok) { console.error('Save failed', res.status); alert('Save failed.'); return; }
+            const json = await res.json();
+            const id = (json?.data?.id as number | undefined) ?? null;
+            setLastSavedId(id);
+            setInfoToast(id ? `Template saved (id ${id})` : 'Template saved');
+            window.setTimeout(() => setInfoToast(null), 2500);
+        } catch (e) { console.error(e); alert('Unexpected error while saving template.'); }
+        finally { setSaveBusy(false); }
+    }, [saveBusy, serializeTemplate]);
+
+    const onLoadTemplate = useCallback(async () => {
+        if (loadBusy) return;
+        const idStr = window.prompt('Enter template ID to load'+(lastSavedId ? ` (last saved: ${lastSavedId})` : '')+':');
+        if (!idStr) return;
+        const id = Number(idStr); if (!Number.isFinite(id)) { alert('Invalid template id.'); return; }
+        setLoadBusy(true);
+        try {
+            const res = await fetch(`/api/templates/${id}`, { headers: { Accept: 'application/json' } });
+            if (!res.ok) { alert('Template not found or server error.'); return; }
+            clearImages();
+            const json = await res.json();
+            rebuildFromTemplate(json);
+            setInfoToast('Template loaded (images cleared)');
+            window.setTimeout(() => setInfoToast(null), 2500);
+        } catch (e) { console.error(e); alert('Unexpected error while loading template.'); }
+        finally { setLoadBusy(false); }
+    }, [clearImages, lastSavedId, loadBusy, rebuildFromTemplate]);
+
     return (
         <div className="min-h-screen bg-background text-foreground">
             <Head title="Editor" />
@@ -724,21 +851,40 @@ export default function EditorPage() {
                         >
                             {exporting ? 'Exporting…' : 'Export PNG'}
                         </button>
-                        <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent" disabled>
-                            Save Template
+                        <button
+                            type="button"
+                            onClick={onSaveTemplate}
+                            disabled={saveBusy}
+                            className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+                            title="Save Template"
+                        >
+                            {saveBusy ? 'Saving…' : 'Save Template'}
                         </button>
-                        <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent" disabled>
-                            Load Template
+                        <button
+                            type="button"
+                            onClick={onLoadTemplate}
+                            disabled={loadBusy}
+                            className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+                            title="Load Template"
+                        >
+                            {loadBusy ? 'Loading…' : 'Load Template'}
                         </button>
                     </div>
                 </div>
             </header>
 
-            {/* Toast */}
+            {/* Toasts */}
             {showToast && (
                 <div className="pointer-events-none fixed inset-x-0 top-3 z-50 flex justify-center">
                     <div className="pointer-events-auto rounded-md border border-border bg-emerald-600/95 px-3 py-2 text-sm font-medium text-white shadow">
                         Export success
+                    </div>
+                </div>
+            )}
+            {infoToast && (
+                <div className="pointer-events-none fixed inset-x-0 top-14 z-50 flex justify-center">
+                    <div className="pointer-events-auto rounded-md border border-border bg-slate-800/95 px-3 py-2 text-sm font-medium text-white shadow">
+                        {infoToast}
                     </div>
                 </div>
             )}

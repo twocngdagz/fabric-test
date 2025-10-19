@@ -11,6 +11,19 @@ class UpdateTemplateRequest extends FormRequest
         return true;
     }
 
+    protected function prepareForValidation(): void
+    {
+        // Support minimal { version, canvas:{width,height}, frames:[] } during updates as well.
+        $hasMinimal = $this->has(['canvas.width', 'canvas.height']) && $this->has('frames');
+        if ($hasMinimal) {
+            $this->merge([
+                'canvas_width' => (int) $this->input('canvas.width'),
+                'canvas_height' => (int) $this->input('canvas.height'),
+                'elements' => $this->input('frames', []),
+            ]);
+        }
+    }
+
     public function rules(): array
     {
         return [
@@ -21,4 +34,3 @@ class UpdateTemplateRequest extends FormRequest
         ];
     }
 }
-
