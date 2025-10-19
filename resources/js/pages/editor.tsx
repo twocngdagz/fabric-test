@@ -2,7 +2,8 @@
 import { Head, Link } from '@inertiajs/react';
 import { home } from '@/routes';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Canvas, Pattern, Point, FabricImage, Rect, util } from 'fabric'; // Fabric 6 ESM: use named exports
+import { Canvas, Pattern, Point, FabricImage, Rect, util, type TFiller, type FabricObject } from 'fabric';
+import type { CanvasEvents } from 'fabric';
 
 // Frame metadata type carried in FabricObject.data (Fabric v6 keeps `data: any`)
 type FrameData = {
@@ -47,17 +48,33 @@ async function setBackgroundCover(canvas: Canvas, url: string) {
 
     // Apply as backgroundImage; ensure it follows viewport transform during zoom/pan
     // Fabric 6: use backgroundVpt=true so background scales with zoom
-    (canvas as any).backgroundVpt = true; // backgroundVpt remains in v6
+    const c = canvas as Canvas & { backgroundVpt?: boolean };
+    c.backgroundVpt = true;
     // Clear any previous background image reference
-    canvas.backgroundImage = undefined as any;
+    canvas.backgroundImage = undefined;
     canvas.backgroundImage = img;
     canvas.requestRenderAll();
 }
 
 // Small util: v4+ browsers expose crypto.randomUUID; fallback keeps collisions unlikely
 function newId() {
-    const g = (globalThis as any).crypto?.randomUUID?.();
+    const g = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto?.randomUUID?.();
     return g ?? `f-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+// Helpers to read/write frame data without using `any`
+type WithFrameData<T> = T & { data?: FrameData };
+function setRectData(rect: Rect, data: FrameData) {
+    (rect as WithFrameData<Rect>).data = data;
+}
+function getRectData(rect: Rect): FrameData | undefined {
+    const d = (rect as WithFrameData<Rect>).data;
+    return d && d.type === 'frame' ? d : undefined;
+}
+function getObjectFrameData(obj: FabricObject | undefined | null): FrameData | undefined {
+    if (!obj) return undefined;
+    const d = (obj as WithFrameData<FabricObject>).data;
+    return d && d.type === 'frame' ? d : undefined;
 }
 
 // Snap helpers for a Fabric object (v6). We snap left/top and scaled width/height to grid.
@@ -128,7 +145,7 @@ export default function EditorPage() {
     const getFrames = useCallback(() => {
         const canvas = fabricCanvasRef.current;
         if (!canvas) return [] as Rect[];
-        return canvas.getObjects().filter((o): o is Rect => (o as any).data?.type === 'frame');
+        return canvas.getObjects().filter((o): o is Rect => getObjectFrameData(o) !== undefined);
     }, []);
 
     // Background button -> open file picker
@@ -179,11 +196,11 @@ export default function EditorPage() {
             top,
             width,
             height,
-            fill: 'rgba(59,130,246,0.12)', // Tailwind blue-500 @ 12% opacity
-            stroke: '#3b82f6', // blue-500
+            fill: 'rgba(59,130,246,0.12)',
+            stroke: '#3b82f6',
             strokeWidth: 2,
             strokeDashArray: [6, 6],
-            strokeUniform: true, // Fabric v5+ keep stroke width constant while scaling
+            strokeUniform: true,
             rx: 4,
             ry: 4,
             hasRotatingPoint: false,
@@ -192,8 +209,8 @@ export default function EditorPage() {
             evented: true,
             cornerStyle: 'circle',
             transparentCorners: false,
-        } as any);
-        (rect as any).data = { type: 'frame', frameId: id, fit: 'cover', name: `Frame ${n}` } as FrameData;
+        });
+        setRectData(rect, { type: 'frame', frameId: id, fit: 'cover', name: `Frame ${n}` });
 
         canvas.add(rect);
         canvas.setActiveObject(rect);
@@ -203,8 +220,9 @@ export default function EditorPage() {
         setActiveFrame(rect);
         const scaledW = rect.getScaledWidth();
         const scaledH = rect.getScaledHeight();
-        setNameField(((rect as any).data as FrameData).name);
-        setFitField(((rect as any).data as FrameData).fit);
+        const newData = getRectData(rect);
+        setNameField(newData?.name ?? '');
+        setFitField(newData?.fit ?? 'cover');
         setXField(String(Math.round(rect.left ?? 0)));
         setYField(String(Math.round(rect.top ?? 0)));
         setWField(String(Math.round(scaledW)));
@@ -224,11 +242,11 @@ export default function EditorPage() {
             return;
         }
         setActiveFrame(rect);
-        const d = ((rect as any).data ?? {}) as Partial<FrameData>;
+        const data = getRectData(rect);
         const scaledW = rect.getScaledWidth();
         const scaledH = rect.getScaledHeight();
-        setNameField(d.name ?? '');
-        setFitField((d.fit as any) ?? 'cover');
+        setNameField(data?.name ?? '');
+        setFitField(data?.fit ?? 'cover');
         setXField(String(Math.round(rect.left ?? 0)));
         setYField(String(Math.round(rect.top ?? 0)));
         setWField(String(Math.round(scaledW)));
@@ -295,15 +313,15 @@ export default function EditorPage() {
             pctx.lineTo(0, grid);
             pctx.stroke();
             const pattern = new Pattern({ source: patternCanvas, repeat: 'repeat' });
-            // Fabric 6: backgroundColor is a property; assign Pattern and then render
-            (canvas as any).backgroundColor = pattern as unknown as string; // TFiller supported in v6 typings
+            // Fabric 6: backgroundColor accepts TFiller; assign Pattern
+            canvas.backgroundColor = pattern as unknown as TFiller;
             canvas.requestRenderAll();
         }
 
         // Selection listeners (Fabric v5/6): selection:created/updated/cleared
         const onSelectionChange = () => {
             const obj = canvas.getActiveObject();
-            if ((obj as any)?.data?.type === 'frame') {
+            if (getObjectFrameData(obj)) {
                 syncPanelFromRect(obj as Rect);
             } else {
                 syncPanelFromRect(null);
@@ -314,9 +332,9 @@ export default function EditorPage() {
         canvas.on('selection:cleared', onSelectionChange);
 
         // Live update panel when moving/scaling the active frame
-        const onMovingOrScaling = (e: any) => {
-            const t = e?.target as Rect | undefined;
-            if (!t || (t as any).data?.type !== 'frame') return;
+        const onMovingOrScaling = (e: CanvasEvents['object:moving']) => {
+            const t = e?.target as Rect;
+            if (!t || !getRectData(t)) return;
             // Refresh panel numeric values in real-time
             setXField(String(Math.round(t.left ?? 0)));
             setYField(String(Math.round(t.top ?? 0)));
@@ -324,12 +342,12 @@ export default function EditorPage() {
             setHField(String(Math.round(t.getScaledHeight())));
         };
         canvas.on('object:moving', onMovingOrScaling);
-        canvas.on('object:scaling', onMovingOrScaling);
+        canvas.on('object:scaling', onMovingOrScaling as unknown as (e: CanvasEvents['object:scaling']) => void);
 
         // Snap on modify end (Fabric v5+ fires object:modified for move/scale/rotate completion)
-        const onModified = (e: any) => {
-            const t = e?.target as Rect | undefined;
-            if (!t || (t as any).data?.type !== 'frame') return;
+        const onModified = (e: CanvasEvents['object:modified']) => {
+            const t = e?.target as Rect;
+            if (!t || !getRectData(t)) return;
             snapToGrid(t);
             canvas.requestRenderAll();
             // After snap, re-sync
@@ -351,8 +369,8 @@ export default function EditorPage() {
                 e.preventDefault();
                 zoomOut();
             } else if (e.key === 'Delete') {
-                const obj = canvas.getActiveObject() as any;
-                if (obj && obj.data?.type === 'frame') {
+                const obj = canvas.getActiveObject();
+                if (obj && getObjectFrameData(obj)) {
                     canvas.remove(obj);
                     canvas.discardActiveObject();
                     canvas.requestRenderAll();
@@ -367,7 +385,7 @@ export default function EditorPage() {
             canvas.off('selection:updated', onSelectionChange);
             canvas.off('selection:cleared', onSelectionChange);
             canvas.off('object:moving', onMovingOrScaling);
-            canvas.off('object:scaling', onMovingOrScaling);
+            canvas.off('object:scaling', onMovingOrScaling as unknown as (e: CanvasEvents['object:scaling']) => void);
             canvas.off('object:modified', onModified);
             window.removeEventListener('keydown', onKeyDown);
             // Fabric 6 cleanup: dispose releases events, DOM refs, and internal state
@@ -382,8 +400,9 @@ export default function EditorPage() {
         setNameField(e.target.value);
         const rect = activeFrame;
         if (!rect) return;
-        const d = (((rect as any).data ?? {}) as FrameData);
-        (rect as any).data = { ...d, name: e.target.value } satisfies FrameData;
+        const d = getRectData(rect);
+        if (!d) return;
+        setRectData(rect, { ...d, name: e.target.value });
     }, [activeFrame]);
 
     const onChangeFit = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -391,8 +410,9 @@ export default function EditorPage() {
         setFitField(value);
         const rect = activeFrame;
         if (!rect) return;
-        const d = (((rect as any).data ?? {}) as FrameData);
-        (rect as any).data = { ...d, fit: value } satisfies FrameData;
+        const d = getRectData(rect);
+        if (!d) return;
+        setRectData(rect, { ...d, fit: value });
     }, [activeFrame]);
 
     const onChangeX = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
