@@ -1,8 +1,101 @@
 // filepath: resources/js/pages/editor.tsx
 import { Head, Link } from '@inertiajs/react';
 import { home } from '@/routes';
+import React, { useCallback, useEffect, useRef } from 'react';
+import { Canvas, Pattern, Point } from 'fabric'; // Fabric 6 ESM: use named exports (Canvas, Pattern, Point)
 
 export default function EditorPage() {
+    // Fabric canvas refs
+    const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
+    const fabricCanvasRef = useRef<Canvas | null>(null);
+
+    // Zoom helpers (Fabric 6): use zoomToPoint for centered zoom
+    const zoomBy = useCallback((factor: number) => {
+        const canvas = fabricCanvasRef.current;
+        if (!canvas) return;
+        let next = canvas.getZoom() * factor;
+        // Clamp zoom to sane bounds
+        next = Math.max(0.1, Math.min(10, next));
+        const center = new Point(canvas.getWidth() / 2, canvas.getHeight() / 2);
+        canvas.zoomToPoint(center, next);
+        canvas.requestRenderAll();
+    }, []);
+
+    const zoomIn = useCallback(() => zoomBy(1.1), [zoomBy]);
+    const zoomOut = useCallback(() => zoomBy(1 / 1.1), [zoomBy]);
+
+    const resetView = useCallback(() => {
+        const canvas = fabricCanvasRef.current;
+        if (!canvas) return;
+        // Fabric 6: reset viewport transform and zoom to defaults
+        canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+        canvas.setZoom(1);
+        canvas.requestRenderAll();
+    }, []);
+
+    useEffect(() => {
+        const el = canvasElementRef.current;
+        if (!el) return;
+
+        // Initialize Fabric 6 canvas
+        const canvas = new Canvas(el, {
+            width: 1200,
+            height: 800,
+            preserveObjectStacking: true,
+            // keep background transparent; grid pattern applied below
+            backgroundColor: 'transparent',
+        });
+        fabricCanvasRef.current = canvas;
+
+        // Draw a faint 20px grid as a repeating background pattern
+        const grid = 20;
+        const patternCanvas = document.createElement('canvas');
+        patternCanvas.width = grid;
+        patternCanvas.height = grid;
+        const pctx = patternCanvas.getContext('2d');
+        if (pctx) {
+            pctx.clearRect(0, 0, grid, grid);
+            pctx.strokeStyle = 'rgba(0,0,0,0.08)'; // subtle grid
+            pctx.lineWidth = 1;
+            // top and left lines to create tileable grid
+            pctx.beginPath();
+            pctx.moveTo(0, 0);
+            pctx.lineTo(grid, 0);
+            pctx.moveTo(0, 0);
+            pctx.lineTo(0, grid);
+            pctx.stroke();
+            const pattern = new Pattern({ source: patternCanvas, repeat: 'repeat' });
+            // Fabric 6: backgroundColor is a property; assign Pattern and then render
+            canvas.backgroundColor = pattern as unknown as string; // TFiller supported in v6 typings
+            canvas.requestRenderAll();
+        }
+
+        // Keyboard zoom shortcuts: + to zoom in, - to zoom out
+        const onKeyDown = (e: KeyboardEvent) => {
+            const target = e.target as HTMLElement | null;
+            // Do not hijack when typing into inputs/textareas/contenteditable
+            if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+                return;
+            }
+            if (e.key === '+' || e.code === 'Equal' || e.code === 'NumpadAdd') {
+                e.preventDefault();
+                zoomIn();
+            } else if (e.key === '-' || e.code === 'Minus' || e.code === 'NumpadSubtract') {
+                e.preventDefault();
+                zoomOut();
+            }
+        };
+        window.addEventListener('keydown', onKeyDown);
+
+        return () => {
+            window.removeEventListener('keydown', onKeyDown);
+            // Fabric 6 cleanup: dispose releases events, DOM refs, and internal state
+            canvas.dispose();
+            fabricCanvasRef.current = null;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [zoomIn, zoomOut]);
+
     return (
         <div className="min-h-screen bg-background text-foreground">
             <Head title="Editor" />
@@ -14,8 +107,9 @@ export default function EditorPage() {
                         <Link href={home()} className="underline underline-offset-2 hover:opacity-80">
                             ← Home
                         </Link>
-                        <span className="hidden text-muted-foreground sm:inline">Fabric Canvas Editor (skeleton)</span>
+                        <span className="hidden text-muted-foreground sm:inline">Fabric Canvas Editor</span>
                     </div>
+                    {/* Toolbar buttons intentionally left non-functional; functions exist (zoomIn/zoomOut/resetView) */}
                     <div className="flex flex-wrap items-center gap-2">
                         <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent">
                             Background
@@ -48,15 +142,19 @@ export default function EditorPage() {
                     <section className="rounded-lg border border-border bg-card p-3">
                         <div className="flex w-full items-center justify-center">
                             {/* Centered canvas container with checkerboard background */}
-                            <div
-                                className="bg-checker relative w-full max-w-4xl rounded-md border border-border shadow-sm"
-                            >
-                                {/* Reserve responsive height without Fabric; tweak as needed */}
-                                <div className="h-[320px] sm:h-[420px] md:h-[520px] lg:h-[640px]" />
+                            <div className="relative max-w-full overflow-auto rounded-md border border-border shadow-sm">
+                                {/* Fixed-size working area per requirements (1200x800) */}
+                                <div className="bg-checker flex items-center justify-center p-4">
+                                    <canvas
+                                        ref={canvasElementRef}
+                                        // Do not set CSS width/height to avoid stretching. Fabric sets attributes.
+                                        className="block"
+                                    />
+                                </div>
                             </div>
                         </div>
                         <p className="mt-3 text-center text-xs text-muted-foreground">
-                            Canvas area (no Fabric yet). The checkerboard indicates transparency.
+                            Canvas area with Fabric 6. Use + / - keys to zoom. The checkerboard indicates transparency.
                         </p>
                     </section>
 
@@ -66,11 +164,7 @@ export default function EditorPage() {
                         <div className="space-y-2 text-sm text-muted-foreground">
                             <div className="grid grid-cols-3 gap-2">
                                 <label className="col-span-1 self-center">Name</label>
-                                <input
-                                    className="col-span-2 rounded-md border border-input bg-background px-2 py-1"
-                                    placeholder="—"
-                                    disabled
-                                />
+                                <input className="col-span-2 rounded-md border border-input bg-background px-2 py-1" placeholder="—" disabled />
                             </div>
                             <div className="grid grid-cols-3 gap-2">
                                 <label className="col-span-1 self-center">X</label>
@@ -96,4 +190,3 @@ export default function EditorPage() {
         </div>
     );
 }
-
