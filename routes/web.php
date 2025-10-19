@@ -11,6 +11,10 @@ Route::get('/canvas', function () {
     return Inertia::render('canvas');
 })->name('canvas');
 
+Route::get('/editor', function () {
+    return Inertia::render('editor');
+})->name('editor');
+
 Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('dashboard', function () {
         return Inertia::render('dashboard');
