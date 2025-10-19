@@ -5,6 +5,7 @@
 /public/hot
 /public/storage
 /public/uploads/*
+/public/exports/*
 !/public/uploads/.gitkeep
 /resources/js/actions
 /resources/js/routes
