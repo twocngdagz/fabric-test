@@ -33,6 +33,46 @@ API routes (prefix: `/api`)
     - Store: `name` required, `canvas_width` 1..8192, `canvas_height` 1..8192, `elements` array
     - Update: same fields optional
 
+## Template Save/Load
+
+Minimal Template JSON (v1). Only essentials are stored. Background and images are intentionally not persisted.
+
+```json
+{
+  "version": 1,
+  "canvas": { "width": 1200, "height": 800 },
+  "frames": [
+    { "id": "f-abc", "x": 40, "y": 60, "w": 400, "h": 300, "fit": "cover", "name": "Hero" },
+    { "id": "f-def", "x": 480, "y": 60, "w": 300, "h": 300, "fit": "contain", "name": "Thumb" }
+  ]
+}
+```
+
+Frontend (Editor UI at `/editor`):
+- Save Template: serializes minimal JSON and POSTs to `/api/templates`. A toast shows the created ID.
+- Load Template: prompts for an ID, GETs `/api/templates/{id}`, clears any images, resizes the canvas, and restores frames exactly. Images are not part of the template, by design.
+
+API usage examples
+
+```bash
+# Save (create) a template
+curl -s -H 'Content-Type: application/json' -d '{
+  "version": 1,
+  "canvas": { "width": 1200, "height": 800 },
+  "frames": [ { "id": "f-abc", "x": 40, "y": 60, "w": 400, "h": 300, "fit": "cover", "name": "Hero" } ]
+}' http://127.0.0.1:8000/api/templates
+
+# Load (show) a template
+curl -s http://127.0.0.1:8000/api/templates/1
+```
+
+Notes
+- Throttling is defined in `App\Providers\AppServiceProvider` via named limiters `uploads` and `exports`.
+- Files are saved under `public/uploads` and `public/exports` making the returned URLs directly accessible.
+- React/Fabric integrations are in `resources/js/pages/editor.tsx` (advanced editor) and `resources/js/pages/canvas.tsx` (simple demo). Fabric v6 specifics are annotated inline.
+
+## Development
+
 Quick start (dev)
 
 ```bash
@@ -46,30 +86,15 @@ php artisan migrate --force
 
 # 3) Start dev server
 php artisan serve --host=127.0.0.1 --port=8000
+
+# 4) Frontend
+npm install
+npm run dev
 ```
 
-Verify routes
+Quality checks
 
 ```bash
-php artisan route:list | grep -E "api/(upload|export|templates)"
+npm run types
+npm run lint
 ```
-
-Smoke test
-
-```bash
-# Upload (1x1 png)
-IMG=/tmp/pixel.png; echo iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII= | base64 -D > "$IMG"
-curl -s -X POST -F "image=@$IMG;type=image/png" http://127.0.0.1:8000/api/upload
-
-# Export (from dataUrl)
-DATA=$(cat "$IMG" | base64)
-curl -s -H "Content-Type: application/json" \
-  -d "{\"dataUrl\":\"data:image/png;base64,$DATA\",\"name\":\"test-export\"}" \
-  http://127.0.0.1:8000/api/export
-```
-
-Notes
-- Throttling is defined in `App\Providers\AppServiceProvider` via named limiters `uploads` and `exports`.
-- Files are saved under `public/uploads` and `public/exports` making the returned URLs directly accessible.
-- React/Fabric integrations are in `resources/js/pages/canvas.tsx`. For SSR safety, Fabric v6 is dynamically imported in effects.
-
