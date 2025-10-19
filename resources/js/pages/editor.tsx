@@ -2,12 +2,54 @@
 import { Head, Link } from '@inertiajs/react';
 import { home } from '@/routes';
 import React, { useCallback, useEffect, useRef } from 'react';
-import { Canvas, Pattern, Point } from 'fabric'; // Fabric 6 ESM: use named exports (Canvas, Pattern, Point)
+import { Canvas, Pattern, Point, FabricImage } from 'fabric'; // Fabric 6 ESM: use named exports
+
+// Helper: set a background image with CSS-like `cover` behavior and center it.
+// Fabric 6: backgroundImage is a FabricObject assigned via property (no setBackgroundImage())
+async function setBackgroundCover(canvas: Canvas, url: string) {
+    // Load image (Fabric 6): static fromURL returns a Promise<FabricImage>
+    const img = await FabricImage.fromURL(url);
+
+    // Compute cover scale to fill 1200x800 while preserving aspect ratio
+    const cw = canvas.getWidth();
+    const ch = canvas.getHeight();
+    const iw = img.width ?? 0;
+    const ih = img.height ?? 0;
+    if (!iw || !ih) {
+        throw new Error('Failed to read image dimensions');
+    }
+    const scale = Math.max(cw / iw, ch / ih);
+
+    // Configure image transform and anchoring
+    img.set({
+        originX: 'center',
+        originY: 'center',
+        left: cw / 2,
+        top: ch / 2,
+        angle: 0,
+        // background image should not be interactive; although not selectable as background,
+        // keep flags off for safety if reused elsewhere
+        selectable: false,
+        evented: false,
+        excludeFromExport: false,
+    });
+    img.scaleX = scale;
+    img.scaleY = scale;
+
+    // Apply as backgroundImage; ensure it follows viewport transform during zoom/pan
+    // Fabric 6: use backgroundVpt=true so background scales with zoom
+    canvas.backgroundVpt = true;
+    // Clear any previous background image reference
+    canvas.backgroundImage = undefined;
+    canvas.backgroundImage = img;
+    canvas.requestRenderAll();
+}
 
 export default function EditorPage() {
     // Fabric canvas refs
     const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
     const fabricCanvasRef = useRef<Canvas | null>(null);
+    const fileInputRef = useRef<HTMLInputElement | null>(null);
 
     // Zoom helpers (Fabric 6): use zoomToPoint for centered zoom
     const zoomBy = useCallback((factor: number) => {
@@ -31,6 +73,35 @@ export default function EditorPage() {
         canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
         canvas.setZoom(1);
         canvas.requestRenderAll();
+    }, []);
+
+    // Background button -> open file picker
+    const onPickBackground = useCallback(() => {
+        fileInputRef.current?.click();
+    }, []);
+
+    // Upload selected file and set as background cover
+    const onFileSelected = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        // Reset the input so selecting the same file again triggers change
+        e.target.value = '';
+        if (!file) return;
+        try {
+            const form = new FormData();
+            // Laravel 12 UploadController expects field name 'image'
+            form.append('image', file);
+            const res = await fetch('/api/upload', { method: 'POST', body: form });
+            if (!res.ok) throw new Error(`Upload failed (${res.status})`);
+            const data = (await res.json()) as { url?: string };
+            if (!data.url) throw new Error('Invalid upload response');
+            const canvas = fabricCanvasRef.current;
+            if (!canvas) return;
+            await setBackgroundCover(canvas, data.url);
+        } catch (err) {
+            // Minimal UX; production could use a toast
+            console.error(err);
+            alert('Failed to set background image. Please try another file.');
+        }
     }, []);
 
     useEffect(() => {
@@ -111,9 +182,16 @@ export default function EditorPage() {
                     </div>
                     {/* Toolbar buttons intentionally left non-functional; functions exist (zoomIn/zoomOut/resetView) */}
                     <div className="flex flex-wrap items-center gap-2">
-                        <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent">
+                        <button type="button" onClick={onPickBackground} className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent">
                             Background
                         </button>
+                        <input
+                            ref={fileInputRef}
+                            type="file"
+                            accept="image/*"
+                            className="sr-only"
+                            onChange={onFileSelected}
+                        />
                         <button type="button" className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent">
                             Add Frame
                         </button>
